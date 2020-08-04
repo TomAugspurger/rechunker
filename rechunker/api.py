@@ -8,6 +8,7 @@ import dask
 
 from rechunker.algorithm import rechunking_plan
 from rechunker.types import ArrayProxy, CopySpec, Executor
+from rechunker.utils import parse_bytes
 
 
 class Rechunked:
@@ -303,8 +304,7 @@ def _setup_array_rechunk(
                 f"Got array_dims {array_dims}, target_chunks {target_chunks}."
             )
 
-    # TODO: rewrite to avoid the hard dependency on dask
-    max_mem = dask.utils.parse_bytes(max_mem)
+    max_mem = parse_bytes(max_mem)
 
     # don't consolidate reads for Dask arrays
     consolidate_reads = isinstance(source_array, zarr.core.Array)
