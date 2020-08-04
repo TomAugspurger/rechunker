@@ -1,10 +1,11 @@
 """User-facing functions."""
 import html
+import functools
 import textwrap
 from typing import Union
 
 import zarr
-import dask
+import dask.array
 
 from rechunker.algorithm import rechunking_plan
 from rechunker.types import ArrayProxy, CopySpec, Executor
@@ -218,75 +219,102 @@ def rechunk(
     """
     if isinstance(executor, str):
         executor = _get_executor(executor)
-    copy_spec, intermediate, target = _setup_rechunk(
+    copy_spec, intermediate, target = rechunk_object(
         source, target_chunks, max_mem, target_store, temp_store
     )
     plan = executor.prepare_plan(copy_spec)
     return Rechunked(executor, plan, source, intermediate, target)
 
 
-def _setup_rechunk(
-    source, target_chunks, max_mem, target_store, temp_store=None,
-):
-    if isinstance(source, zarr.hierarchy.Group):
-        if not isinstance(target_chunks, dict):
-            raise ValueError(
-                "You must specify ``target-chunks`` as a dict when rechunking a group."
-            )
-
-        if temp_store:
-            temp_group = zarr.group(temp_store)
-        else:
-            temp_group = None
-        target_group = zarr.group(target_store)
-        target_group.attrs.update(source.attrs)
-
-        copy_specs = []
-        for array_name, array_target_chunks in target_chunks.items():
-            copy_spec = _setup_array_rechunk(
-                source[array_name],
-                array_target_chunks,
-                max_mem,
-                target_group,
-                temp_store_or_group=temp_group,
-                name=array_name,
-            )
-            copy_specs.append(copy_spec)
-
-        return copy_specs, temp_group, target_group
-
-    elif isinstance(source, (zarr.core.Array, dask.array.Array)):
-
-        copy_spec = _setup_array_rechunk(
-            source,
-            target_chunks,
-            max_mem,
-            target_store,
-            temp_store_or_group=temp_store,
-        )
-        intermediate = copy_spec.intermediate.array
-        target = copy_spec.write.array
-        return [copy_spec], intermediate, target
-
-    else:
-        raise ValueError("Source must be a Zarr Array or Group, or a Dask Array.")
-
-
-def _setup_array_rechunk(
-    source_array,
+@functools.singledispatch
+def rechunk_object(
+    source,
     target_chunks,
     max_mem,
     target_store_or_group,
-    temp_store_or_group=None,
+    temp_store_or_group,
     name=None,
-) -> CopySpec:
-    shape = source_array.shape
+):
+    """
+    Rechunk an object `source`.
+
+    See the documentation of :meth:`rechunk` for the parameter definitions.
+
+    Notes
+    -----
+    This is a singly-dispatched function. By default, the following types
+    are supported.
+
+    * zarr.Array
+    * zarr.Group
+    * dask.array.Array
+
+    Register additional types with
+
+    .. code-block:: python
+
+       @rechunker.rechunk_object.register
+       def _(source: MyObject, ...):
+           pass
+
+    See Also
+    -------
+    rechunk
+    """
+    raise ValueError(f"Cannot rechunk object of type {type(source)}")
+
+
+@rechunk_object.register
+def _(
+    source: zarr.hierarchy.Group,
+    target_chunks,
+    max_mem,
+    target_store_or_group,
+    temp_store_or_group,
+    name=None,
+):
+    if not isinstance(target_chunks, dict):
+        raise ValueError(
+            "You must specify ``target-chunks`` as a dict when rechunking a group."
+        )
+
+    if temp_store_or_group:
+        temp_group = zarr.group(temp_store_or_group)
+    else:
+        temp_group = None
+    target_group = zarr.group(target_store_or_group)
+    target_group.attrs.update(source.attrs)
+
+    copy_specs = []
+    for array_name, array_target_chunks in target_chunks.items():
+        [copy_spec], _, _ = rechunk_object(
+            source[array_name],
+            array_target_chunks,
+            max_mem,
+            target_group,
+            temp_store_or_group=temp_group,
+            name=array_name,
+        )
+        copy_specs.append(copy_spec)
+    return copy_specs, temp_group, target_group
+
+
+@rechunk_object.register(zarr.Array)
+@rechunk_object.register(dask.array.Array)
+def rechunk_array(
+    source: Union[zarr.Array, dask.array.Array],
+    target_chunks,
+    max_mem,
+    target_store_or_group,
+    temp_store_or_group,
+    name=None,
+):
+
+    shape = source.shape
     source_chunks = (
-        source_array.chunksize
-        if isinstance(source_array, dask.array.Array)
-        else source_array.chunks
+        source.chunksize if isinstance(source, dask.array.Array) else source.chunks
     )
-    dtype = source_array.dtype
+    dtype = source.dtype
     itemsize = dtype.itemsize
 
     if target_chunks is None:
@@ -294,7 +322,7 @@ def _setup_array_rechunk(
         target_chunks = source_chunks
 
     if isinstance(target_chunks, dict):
-        array_dims = _get_dims_from_zarr_array(source_array)
+        array_dims = _get_dims_from_zarr_array(source)
         try:
             target_chunks = _shape_dict_to_tuple(array_dims, target_chunks)
         except KeyError:
@@ -307,7 +335,7 @@ def _setup_array_rechunk(
     max_mem = dask.utils.parse_bytes(max_mem)
 
     # don't consolidate reads for Dask arrays
-    consolidate_reads = isinstance(source_array, zarr.core.Array)
+    consolidate_reads = isinstance(source, zarr.core.Array)
     read_chunks, int_chunks, write_chunks = rechunking_plan(
         shape,
         source_chunks,
@@ -327,7 +355,7 @@ def _setup_array_rechunk(
         shape, target_store_or_group, target_chunks, dtype, name=name
     )
     try:
-        target_array.attrs.update(source_array.attrs)
+        target_array.attrs.update(source.attrs)
     except AttributeError:
         pass
 
@@ -340,7 +368,11 @@ def _setup_array_rechunk(
             shape, temp_store_or_group, int_chunks, dtype, name=name
         )
 
-    read_proxy = ArrayProxy(source_array, read_chunks)
+    read_proxy = ArrayProxy(source, read_chunks)
     int_proxy = ArrayProxy(int_array, int_chunks)
     write_proxy = ArrayProxy(target_array, write_chunks)
-    return CopySpec(read_proxy, int_proxy, write_proxy)
+    copy_spec = CopySpec(read_proxy, int_proxy, write_proxy)
+
+    intermediate = copy_spec.intermediate.array
+    target = copy_spec.write.array
+    return [copy_spec], intermediate, target
